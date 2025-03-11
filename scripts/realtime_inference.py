@@ -193,6 +193,7 @@ class Avatar:
                        video_len,
                        skip_save_images):
         print(video_len)
+        process_times = []
         while True:
             if self.idx>=video_len-1:
                 break
@@ -206,17 +207,42 @@ class Avatar:
             ori_frame = copy.deepcopy(self.frame_list_cycle[self.idx%(len(self.frame_list_cycle))])
             x1, y1, x2, y2 = bbox
             try:
+                resize_start = time.time()
                 res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
+                resize_time = time.time() - resize_start
             except:
                 continue
+                
             mask = self.mask_list_cycle[self.idx%(len(self.mask_list_cycle))]
             mask_crop_box = self.mask_coords_list_cycle[self.idx%(len(self.mask_coords_list_cycle))]
-            #combine_frame = get_image(ori_frame,res_frame,bbox)
+            
+            blend_start = time.time()
             combine_frame = get_image_blending(ori_frame,res_frame,bbox,mask,mask_crop_box)
+            blend_time = time.time() - blend_start
 
             if skip_save_images is False:
+                save_start = time.time()
                 cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png",combine_frame)
+                save_time = time.time() - save_start
+            else:
+                save_time = 0
+                
+            process_time = time.time() - start
+            process_times.append({
+                'resize': resize_time * 1000,
+                'blend': blend_time * 1000,
+                'save': save_time * 1000,
+                'total': process_time * 1000
+            })
             self.idx = self.idx + 1
+            
+        # 计算平均耗时
+        avg_times = {k: sum(d[k] for d in process_times)/len(process_times) for k in process_times[0]}
+        print("\n每帧平均处理时间:")
+        print(f"调整大小: {avg_times['resize']:.2f}ms")
+        print(f"图像融合: {avg_times['blend']:.2f}ms") 
+        print(f"保存图片: {avg_times['save']:.2f}ms")
+        print(f"总处理时间: {avg_times['total']:.2f}ms")
 
     def inference(self, 
                   audio_path, 
@@ -224,25 +250,30 @@ class Avatar:
                   fps,
                   skip_save_images):
         os.makedirs(self.avatar_path+'/tmp',exist_ok =True)   
-        print("start inference")
-        ############################################## extract audio feature ##############################################
-        start_time = time.time()
+        print("开始推理")
+        
+        ############################################## 提取音频特征 ##############################################
+        audio_start = time.time()
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature,fps=fps)
-        print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
-        ############################################## inference batch by batch ##############################################
+        audio_time = time.time() - audio_start
+        print(f"音频处理耗时: {audio_time * 1000:.2f}ms")
+        
+        ############################################## 批量推理 ##############################################
         video_num = len(whisper_chunks)   
         res_frame_queue = queue.Queue()
         self.idx = 0
-        # # Create a sub-thread and start it
+        
         process_thread = threading.Thread(target=self.process_frames, args=(res_frame_queue, video_num, skip_save_images))
         process_thread.start()
 
         gen = datagen(whisper_chunks,
                       self.input_latent_list_cycle, 
                       self.batch_size)
+                      
+        inference_times = []
+        decode_times = []
         start_time = time.time()
-        res_frame_list = []
         
         for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/self.batch_size)))):
             audio_feature_batch = torch.from_numpy(whisper_batch)
@@ -251,38 +282,49 @@ class Avatar:
             audio_feature_batch = pe(audio_feature_batch)
             latent_batch = latent_batch.to(dtype=unet.model.dtype)
 
+            inference_start = time.time()
             pred_latents = unet.model(latent_batch, 
                                       timesteps, 
                                       encoder_hidden_states=audio_feature_batch).sample
+            inference_time = time.time() - inference_start
+            inference_times.append(inference_time)
+            
+            decode_start = time.time()                                  
             recon = vae.decode_latents(pred_latents)
+            decode_time = time.time() - decode_start
+            decode_times.append(decode_time)
+            
             for res_frame in recon:
                 res_frame_queue.put(res_frame)
-        # Close the queue and sub-thread after all tasks are completed
+                
         process_thread.join()
+        total_time = time.time() - start_time
+        
+        # 计算平均推理时间
+        avg_inference = sum(inference_times) * 1000 / len(inference_times)
+        avg_decode = sum(decode_times) * 1000 / len(decode_times)
+        print(f"\nUNet推理平均耗时: {avg_inference:.2f}ms/batch")
+        print(f"VAE解码平均耗时: {avg_decode:.2f}ms/batch")
         
         if args.skip_save_images is True:
-            print('Total process time of {} frames without saving images = {}s'.format(
-                        video_num,
-                        time.time()-start_time))
+            print(f'处理 {video_num} 帧总耗时(不含保存图片): {total_time:.2f}s')
         else:
-            print('Total process time of {} frames including saving images = {}s'.format(
-                        video_num,
-                        time.time()-start_time))
+            print(f'处理 {video_num} 帧总耗时(含保存图片): {total_time:.2f}s')
 
         if out_vid_name is not None and args.skip_save_images is False: 
-            # optional
+            # 可选
             cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.avatar_path}/tmp/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {self.avatar_path}/temp.mp4"
             print(cmd_img2video)
             os.system(cmd_img2video)
 
-            output_vid = os.path.join(self.video_out_path, out_vid_name+".mp4") # on
+            output_vid = os.path.join(self.video_out_path, out_vid_name+".mp4")
             cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {self.avatar_path}/temp.mp4 {output_vid}"
             print(cmd_combine_audio)
             os.system(cmd_combine_audio)
 
             os.remove(f"{self.avatar_path}/temp.mp4")
             shutil.rmtree(f"{self.avatar_path}/tmp")
-            print(f"result is save to {output_vid}")
+            print(f"结果已保存至 {output_vid}")
         print("\n")
        
 

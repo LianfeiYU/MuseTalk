@@ -91,7 +91,8 @@ def get_image_blending(image,face,face_box,mask_array,crop_box):
     x_s, y_s, x_e, y_e = crop_box
     face_large = copy.deepcopy(body[y_s:y_e, x_s:x_e])
     face_large[y-y_s:y1-y_s, x-x_s:x1-x_s]=face
-
+    
+    # print("mask_array.shape", mask_array.shape)
     mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
     mask_image = (mask_image/255).astype(np.float32)
 
